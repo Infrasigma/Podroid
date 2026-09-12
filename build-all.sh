@@ -10,6 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JNILIBS="${SCRIPT_DIR}/app/src/main/jniLibs/arm64-v8a"
 ASSETS="${SCRIPT_DIR}/app/src/main/assets"
+ADMISSION_OUT="${SCRIPT_DIR}/build/admission"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 BLUE='\033[1;34m'
@@ -39,6 +40,7 @@ Commands:
   apk           Build the Android APK (also builds libtermux.so via Gradle NDK)
   deploy        Build APK, uninstall old version, and install to device
   test          Perform full build, install, and automated boot validation
+  admission     Build/install/boot and run ACE guest admission via SSH when enabled
   clean         Remove build artifacts and temporary containers
 
 Options:
@@ -136,23 +138,22 @@ build_qemu() {
     local qemu_ver
     qemu_ver=$(grep -E '^podroidQemuVersion=' "${SCRIPT_DIR}/gradle.properties" | cut -d= -f2)
     log "Building QEMU ${qemu_ver} for Android ARM64 (Docker)..."
-    
     docker build --build-arg "QEMU_VERSION=${qemu_ver}" \
         -t podroid-qemu-builder --target final "${SCRIPT_DIR}"
-        
+
     log "Extracting QEMU artifacts..."
     docker rm -f podroid-qemu-extract 2>/dev/null || true
     docker create --name podroid-qemu-extract podroid-qemu-builder /bin/true
-    
+
     mkdir -p "$JNILIBS" "$ASSETS/qemu/keymaps"
     docker cp podroid-qemu-extract:/libqemu-system-aarch64.so "$JNILIBS/"
-    docker cp podroid-qemu-extract:/libslirp.so               "$JNILIBS/"
-    docker cp podroid-qemu-extract:/libpodroid-bridge.so      "$JNILIBS/"
-    docker cp podroid-qemu-extract:/libpodroid-launcher.so    "$JNILIBS/"
-    docker cp podroid-qemu-extract:/qemu/efi-virtio.rom        "$ASSETS/qemu/"
-    docker cp podroid-qemu-extract:/qemu/keymaps/.             "$ASSETS/qemu/keymaps/"
+    docker cp podroid-qemu-extract:/libslirp.so "$JNILIBS/"
+    docker cp podroid-qemu-extract:/libpodroid-bridge.so "$JNILIBS/"
+    docker cp podroid-qemu-extract:/libpodroid-launcher.so "$JNILIBS/"
+    docker cp podroid-qemu-extract:/qemu/efi-virtio.rom "$ASSETS/qemu/"
+    docker cp podroid-qemu-extract:/qemu/keymaps/. "$ASSETS/qemu/keymaps/"
     docker rm podroid-qemu-extract >/dev/null
-    
+
     verify_16kb_align "$JNILIBS/libqemu-system-aarch64.so"
     success "QEMU and bridge ready."
 }
@@ -170,56 +171,47 @@ deploy_apk() {
     success "Deployed and ready."
 }
 
-run_boot_test() {
+wait_for_vm_ready() {
     local pkg="com.excp.podroid.debug"
-    local activity="com.excp.podroid.MainActivity"
-    local timeout=60
-    
-    log "Starting Automated Boot Test..."
-    
-    # Check for device
-    adb devices 2>/dev/null | grep -q 'device$' || error "No device connected via ADB."
-    
-    # Build and Install
-    build_apk
-    deploy_apk
-    
-    # Reset State
-    log "Resetting VM storage for clean test..."
-    adb shell am force-stop "$pkg" 2>/dev/null || true
-    adb shell run-as "$pkg" rm -f files/storage.img 2>/dev/null || true
-    adb shell run-as "$pkg" rm -f files/console.log 2>/dev/null || true
-    
-    # Launch
-    log "Launching App..."
-    adb shell am start -n "$pkg/$activity" >/dev/null 2>&1
-    
-    echo -e "${YELLOW}>>> PLEASE PRESS 'Start Podman' IN THE APP NOW <<<${NC}"
-    
-    # Poll console log
-    log "Waiting for VM to boot (timeout: ${timeout}s)..."
+    local timeout="${1:-60}"
     local boot_ok=false
-    for i in $(seq 1 "$timeout"); do
+    log "Waiting for VM to boot (timeout: ${timeout}s)..."
+    for _i in $(seq 1 "$timeout"); do
         local console
         console=$(adb shell run-as "$pkg" cat files/console.log 2>/dev/null || echo "")
         if echo "$console" | grep -q "Ready!"; then
             boot_ok=true
             break
         fi
-        printf "."
         sleep 1
     done
-    echo ""
-    
-    if [ "$boot_ok" = false ]; then
-        error "VM failed to boot within ${timeout}s. Check 'adb logcat'."
-    fi
-    
-    # Validation
+    "$boot_ok" || error "VM failed to reach Ready! within ${timeout}s; inspect adb logcat and console.log."
+}
+
+run_boot_test() {
+    local pkg="com.excp.podroid.debug"
+    local activity="com.excp.podroid.MainActivity"
+
+    log "Starting Automated Boot Test..."
+    adb devices 2>/dev/null | grep -q 'device$' || error "No device connected via ADB."
+    build_apk
+    deploy_apk
+
+    log "Resetting VM storage for clean test..."
+    adb shell am force-stop "$pkg" 2>/dev/null || true
+    adb shell run-as "$pkg" rm -f files/storage.img 2>/dev/null || true
+    adb shell run-as "$pkg" rm -f files/console.log 2>/dev/null || true
+
+    log "Launching App..."
+    adb shell am start -n "$pkg/$activity" >/dev/null 2>&1
+    echo -e "${YELLOW}>>> Start the VM in Podroid if automatic start is disabled. <<<${NC}"
+
+    wait_for_vm_ready 60
+
     log "Validating boot output..."
     local console
     console=$(adb shell run-as "$pkg" cat files/console.log 2>/dev/null || echo "")
-    
+
     local errors=0
     local checks=("Podroid - Alpine Linux" "IP:" "Ready!" "Loading kernel modules")
     for check in "${checks[@]}"; do
@@ -230,12 +222,66 @@ run_boot_test() {
             errors=$((errors + 1))
         fi
     done
-    
+
     if [ "$errors" -eq 0 ]; then
         success "Automated Boot Test PASSED."
     else
         error "Automated Boot Test FAILED with $errors errors."
     fi
+}
+
+run_admission_test() {
+    local pkg="com.excp.podroid.debug"
+    local activity="com.excp.podroid.MainActivity"
+    local ssh_port=19922
+
+    mkdir -p "$ADMISSION_OUT"
+    adb devices 2>/dev/null | grep -q 'device$' || error "EXTERNAL PHYSICAL GATE: no ADB-connected Android device."
+
+    build_apk
+    build_rootfs
+    build_qemu
+    deploy_apk
+
+    log "Resetting VM storage for clean admission run..."
+    adb shell am force-stop "$pkg" 2>/dev/null || true
+    adb shell run-as "$pkg" rm -f files/storage.img 2>/dev/null || true
+    adb shell run-as "$pkg" rm -f files/console.log 2>/dev/null || true
+    adb shell am start -n "$pkg/$activity" >/dev/null 2>&1
+
+    wait_for_vm_ready 60
+
+    # SSH is the stable machine-readable guest channel already exposed by Podroid.
+    # Do not silently enable it: doing so would change user configuration and could
+    # hide a real physical-gate failure.
+    adb forward "tcp:${ssh_port}" tcp:9922 >/dev/null 2>&1 || true
+
+    if ! command -v ssh >/dev/null 2>&1; then
+        emit_status="name=ace_guest_channel status=UNKNOWN observed=ssh-client-unavailable expected=guest-command-channel reason=host ssh client is unavailable"
+        printf '%s\n' "$emit_status" | tee "$ADMISSION_OUT/summary.txt"
+        error "EXTERNAL PHYSICAL GATE: host ssh client unavailable; VM booted but guest admission command channel was not established."
+    fi
+
+    if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$ssh_port" root@127.0.0.1 true >/dev/null 2>&1; then
+        log "Guest SSH channel established; running ace-podroid-admission."
+        ssh_opts=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p "$ssh_port")
+        ssh "${ssh_opts[@]}" root@127.0.0.1 /usr/local/bin/ace-podroid-admission \
+            | tee "$ADMISSION_OUT/admission.txt"
+    else
+        printf '%s\n' \
+            'name=ace_guest_channel status=UNKNOWN observed=ssh-unavailable expected=guest-command-channel reason=Podroid VM booted but SSH on phone port 9922 is not reachable; SSH is disabled or not exposed.' \
+            | tee "$ADMISSION_OUT/admission.txt"
+        error "EXTERNAL PHYSICAL GATE: guest boot succeeded, but SSH guest channel on port 9922 is unavailable. No admission result was fabricated."
+    fi
+
+    if grep -q 'status=FAIL' "$ADMISSION_OUT/admission.txt"; then
+        error "ACE admission produced one or more FAIL results. See $ADMISSION_OUT/admission.txt"
+    fi
+    if grep -q 'status=UNKNOWN' "$ADMISSION_OUT/admission.txt"; then
+        warn "ACE admission contains UNKNOWN results. This is not admission certification."
+        return 2
+    fi
+    success "All emitted admission criteria are PASS. Physical ACE admission evidence collected."
 }
 
 # ── Main Logic ────────────────────────────────────────────────────────────────
@@ -253,6 +299,7 @@ case "$1" in
     apk)       build_apk ;;
     deploy)    build_apk && deploy_apk ;;
     test)      run_boot_test ;;
+    admission) run_admission_test ;;
     all)
         build_initramfs
         build_rootfs
