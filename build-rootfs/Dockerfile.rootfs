@@ -37,8 +37,9 @@ ENV SYSTEM_VERSION=${SYSTEM_VERSION}
 
 ENV ALPINE_VERSION=${ALPINE_RELEASE}
 COPY files /work/files
+COPY files/usr/local/bin/ace-podroid-admission /work/rootfs/usr/local/bin/ace-podroid-admission
 COPY build-rootfs.sh /work/build-rootfs.sh
-RUN chmod +x /work/build-rootfs.sh && /work/build-rootfs.sh
+RUN chmod +x /work/build-rootfs.sh /work/rootfs/usr/local/bin/ace-podroid-admission && /work/build-rootfs.sh
 
 RUN mksquashfs /work/rootfs /work/alpine-rootfs.squashfs \
     -comp zstd -Xcompression-level 19 -all-root -noappend
