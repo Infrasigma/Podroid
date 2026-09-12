@@ -40,12 +40,12 @@ Commands:
   apk           Build the Android APK (also builds libtermux.so via Gradle NDK)
   deploy        Build APK, uninstall old version, and install to device
   test          Perform full build, install, and automated boot validation
-  admission     Build/install/boot and run ACE guest admission via SSH when enabled
+  admission     Build/install/boot and run ACE guest admission through Podroid's native terminal transport
   clean         Remove build artifacts and temporary containers
 
 Options:
   --fast        Skip QEMU native builds if binaries already exist
-  --help        Show this help message
+  --help        Show help message
 
 EOF
 }
@@ -66,7 +66,7 @@ find_ndk() {
 # ── Verification Helpers ──────────────────────────────────────────────────────
 verify_16kb_align() {
     local lib="$1"
-    python3 - "$lib" << 'EOF'
+    python3 - "$lib" << 'PY'
 import struct, sys
 path = sys.argv[1]
 with open(path, 'rb') as f:
@@ -83,7 +83,7 @@ ok = all(a >= 16384 for a in aligns)
 if not ok:
     print(f"FAILED: {path} is not 16KB page aligned!")
     sys.exit(1)
-EOF
+PY
 }
 
 # ── Build Functions ───────────────────────────────────────────────────────────
@@ -174,11 +174,14 @@ deploy_apk() {
 wait_for_vm_ready() {
     local pkg="com.excp.podroid.debug"
     local timeout="${1:-60}"
+    local serial="${2:-}"
     local boot_ok=false
+    local -a ADB=(adb)
+    [ -n "$serial" ] && ADB=(adb -s "$serial")
     log "Waiting for VM to boot (timeout: ${timeout}s)..."
     for _i in $(seq 1 "$timeout"); do
         local console
-        console=$(adb shell run-as "$pkg" cat files/console.log 2>/dev/null || echo "")
+        console=$("${ADB[@]}" shell run-as "$pkg" cat files/console.log 2>/dev/null || echo "")
         if echo "$console" | grep -q "Ready!"; then
             boot_ok=true
             break
@@ -233,55 +236,181 @@ run_boot_test() {
 run_admission_test() {
     local pkg="com.excp.podroid.debug"
     local activity="com.excp.podroid.MainActivity"
-    local ssh_port=19922
+    local serial=""
+    local bridge_pid=""
+    local bridge_path=""
+    local capture="$ADMISSION_OUT/terminal.capture"
+    local report="$ADMISSION_OUT/admission.txt"
+    local transport_meta="$ADMISSION_OUT/transport.txt"
+    local fifo="$ADMISSION_OUT/terminal.in"
+    local token="ACE_ADMISSION_$(date +%s)_$$"
+    local command_pid=""
+    local exit_marker=""
+    local guest_rc=""
+    local parse_status=""
+    local -a ADB=()
 
     mkdir -p "$ADMISSION_OUT"
-    adb devices 2>/dev/null | grep -q 'device$' || error "EXTERNAL PHYSICAL GATE: no ADB-connected Android device."
+
+    serial=$(adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" { print $1; exit }')
+    if [ -z "$serial" ]; then
+        error "EXTERNAL PHYSICAL GATE: no ADB-connected Android device in state 'device'. Admission cannot begin without a physical device."
+    fi
+    ADB=(adb -s "$serial")
+    printf 'serial=%s\n' "$serial" > "$transport_meta"
 
     build_apk
     build_rootfs
     build_qemu
-    deploy_apk
 
-    log "Resetting VM storage for clean admission run..."
-    adb shell am force-stop "$pkg" 2>/dev/null || true
-    adb shell run-as "$pkg" rm -f files/storage.img 2>/dev/null || true
-    adb shell run-as "$pkg" rm -f files/console.log 2>/dev/null || true
-    adb shell am start -n "$pkg/$activity" >/dev/null 2>&1
+    log "Deploying admission APK to physical device ${serial}..."
+    "${ADB[@]}" uninstall "$pkg" >/dev/null 2>&1 || true
+    "${ADB[@]}" install -r app/build/outputs/apk/debug/app-debug.apk >/dev/null
 
-    wait_for_vm_ready 60
+    log "Resetting dedicated admission VM storage for a clean run..."
+    "${ADB[@]}" shell am force-stop "$pkg" 2>/dev/null || true
+    "${ADB[@]}" shell run-as "$pkg" rm -f files/storage.img 2>/dev/null || true
+    "${ADB[@]}" shell run-as "$pkg" rm -f files/console.log 2>/dev/null || true
+    "${ADB[@]}" shell run-as "$pkg" rm -f files/terminal.sock files/ctrl.sock files/serial.sock files/qmp.sock files/host.sock 2>/dev/null || true
+    rm -f "$capture" "$report" "$fifo"
+    mkfifo "$fifo"
 
-    # SSH is the stable machine-readable guest channel already exposed by Podroid.
-    # Do not silently enable it: doing so would change user configuration and could
-    # hide a real physical-gate failure.
-    adb forward "tcp:${ssh_port}" tcp:9922 >/dev/null 2>&1 || true
+    log "Launching Podroid through its exported foreground START_VM activity path..."
+    "${ADB[@]}" shell am start -n "$pkg/$activity" -a com.excp.podroid.action.START_VM >/dev/null 2>&1 || \
+        error "Could not launch Podroid START_VM activity intent on the physical device."
 
-    if ! command -v ssh >/dev/null 2>&1; then
-        emit_status="name=ace_guest_channel status=UNKNOWN observed=ssh-client-unavailable expected=guest-command-channel reason=host ssh client is unavailable"
-        printf '%s\n' "$emit_status" | tee "$ADMISSION_OUT/summary.txt"
-        error "EXTERNAL PHYSICAL GATE: host ssh client unavailable; VM booted but guest admission command channel was not established."
+    wait_for_vm_ready 60 "$serial"
+
+    log "Locating the existing Podroid terminal bridge and native virtio-console endpoint..."
+    local deadline=$((SECONDS + 20))
+    while (( SECONDS < deadline )); do
+        bridge_pid=$("${ADB[@]}" shell pidof libpodroid-bridge.so 2>/dev/null | tr -d '\r' | awk '{print $1}' || true)
+        if [ -n "$bridge_pid" ]; then
+            bridge_path=$("${ADB[@]}" shell run-as "$pkg" readlink "/proc/${bridge_pid}/exe" 2>/dev/null | tr -d '\r' || true)
+            if [ -n "$bridge_path" ]; then
+                break
+            fi
+        fi
+        sleep 1
+    done
+
+    if [ -z "$bridge_pid" ] || [ -z "$bridge_path" ]; then
+        rm -f "$fifo"
+        error "EXTERNAL PHYSICAL GATE: VM is Ready!, but the existing Podroid terminal bridge process could not be resolved; guest command execution was not attempted."
     fi
 
-    if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$ssh_port" root@127.0.0.1 true >/dev/null 2>&1; then
-        log "Guest SSH channel established; running ace-podroid-admission."
-        ssh_opts=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p "$ssh_port")
-        ssh "${ssh_opts[@]}" root@127.0.0.1 /usr/local/bin/ace-podroid-admission \
-            | tee "$ADMISSION_OUT/admission.txt"
-    else
-        printf '%s\n' \
-            'name=ace_guest_channel status=UNKNOWN observed=ssh-unavailable expected=guest-command-channel reason=Podroid VM booted but SSH on phone port 9922 is not reachable; SSH is disabled or not exposed.' \
-            | tee "$ADMISSION_OUT/admission.txt"
-        error "EXTERNAL PHYSICAL GATE: guest boot succeeded, but SSH guest channel on port 9922 is unavailable. No admission result was fabricated."
+    {
+        printf 'bridge_pid=%s\n' "$bridge_pid"
+        printf 'bridge_path=%s\n' "$bridge_path"
+        printf 'transport=terminal.sock+ctrl.sock via podroid-bridge\n'
+    } >> "$transport_meta"
+
+    log "Detaching the UI bridge and attaching the same native Podroid terminal transport to the admission harness..."
+    "${ADB[@]}" shell run-as "$pkg" kill "$bridge_pid" >/dev/null 2>&1 || true
+    sleep 1
+
+    : > "$capture"
+    : > "$report"
+    "${ADB[@]}" exec-out run-as "$pkg" "$bridge_path" "files/terminal.sock" "files/ctrl.sock" < "$fifo" > "$capture" 2>&1 &
+    command_pid=$!
+    exec {stdin_fd}>"$fifo"
+
+    # The start marker is emitted by the guest shell using octal escapes, so the
+    # literal marker does not occur in the echoed command text. The exit marker
+    # is emitted only after the admission process returns, and carries its real
+    # guest exit status. Both stdout and stderr are intentionally captured through
+    # the PTY because a terminal transport exposes the shell's combined stream.
+    local guest_cmd
+    guest_cmd="printf '\\137\\137ACE_ADMISSION_START_%s__\\n' '$token'; /usr/local/bin/ace-podroid-admission 2>&1; rc=\$?; printf '\\137\\137ACE_ADMISSION_EXIT_%s_%s__\\n' '$token' \"\$rc\""
+    printf '%s\n' "$guest_cmd" >&$stdin_fd
+
+    deadline=$((SECONDS + 180))
+    while (( SECONDS < deadline )); do
+        if [ -f "$capture" ]; then
+            exit_marker=$(grep -a -o "__ACE_ADMISSION_EXIT_${token}_[0-9][0-9]*__" "$capture" 2>/dev/null | tail -1 || true)
+            if [ -n "$exit_marker" ]; then
+                break
+            fi
+        fi
+        if ! kill -0 "$command_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    if [ -z "$exit_marker" ]; then
+        warn "Guest admission did not reach its completion sentinel before timeout; sending Ctrl-C and terminating the native transport."
+        printf '\003' >&$stdin_fd || true
+        sleep 2
+        kill "$command_pid" 2>/dev/null || true
+        wait "$command_pid" 2>/dev/null || true
+        exec {stdin_fd}>&-
+        rm -f "$fifo"
+        printf 'name=ace_guest_transport status=UNKNOWN observed=no-completion-sentinel expected=guest-command-exit-sentinel reason=timed out waiting for deterministic native terminal completion\n' > "$report"
+        printf 'status=UNKNOWN\n' >> "$report"
+        "${ADB[@]}" shell am broadcast -a com.excp.podroid.action.STOP_VM >/dev/null 2>&1 || true
+        error "ACE admission execution timed out without a completion sentinel. See $report"
     fi
 
-    if grep -q 'status=FAIL' "$ADMISSION_OUT/admission.txt"; then
-        error "ACE admission produced one or more FAIL results. See $ADMISSION_OUT/admission.txt"
+    exec {stdin_fd}>&-
+    rm -f "$fifo"
+    kill "$command_pid" 2>/dev/null || true
+    wait "$command_pid" 2>/dev/null || true
+
+    python3 - "$capture" "$token" "$report" << 'PY'
+import pathlib, re, sys
+capture = pathlib.Path(sys.argv[1]).read_bytes()
+token = sys.argv[2].encode()
+report_path = pathlib.Path(sys.argv[3])
+start = b"__ACE_ADMISSION_START_" + token + b"__"
+exit_re = re.compile(rb"__ACE_ADMISSION_EXIT_" + re.escape(token) + rb"_([0-9]+)__")
+start_i = capture.find(start)
+match = exit_re.search(capture, start_i + len(start) if start_i >= 0 else 0)
+if start_i < 0 or match is None:
+    report_path.write_text(
+        "name=ace_guest_transport status=UNKNOWN observed=invalid-native-capture expected=start-and-exit-sentinels reason=guest transport evidence was incomplete\n",
+        encoding="utf-8",
+    )
+    raise SystemExit(2)
+payload = capture[start_i + len(start):match.start()]
+payload = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+report_path.write_bytes(payload)
+(report_path.parent / "guest-exit-status.txt").write_text(match.group(1).decode("ascii") + "\n", encoding="ascii")
+PY
+    parse_status=$?
+
+    if [ "$parse_status" -ne 0 ]; then
+        "${ADB[@]}" shell am broadcast -a com.excp.podroid.action.STOP_VM >/dev/null 2>&1 || true
+        error "Native terminal transport produced incomplete admission evidence. See $report"
     fi
-    if grep -q 'status=UNKNOWN' "$ADMISSION_OUT/admission.txt"; then
+
+    if ! grep -q 'summary_end=1' "$report"; then
+        "${ADB[@]}" shell am broadcast -a com.excp.podroid.action.STOP_VM >/dev/null 2>&1 || true
+        error "Native terminal transport reached an exit sentinel but the guest admission report was incomplete. See $report"
+    fi
+
+    guest_rc=$(cat "$ADMISSION_OUT/guest-exit-status.txt")
+    {
+        printf 'transport=terminal.sock via podroid-bridge\n'
+        printf 'guest_exit_status=%s\n' "$guest_rc"
+    } >> "$transport_meta"
+
+    if grep -q 'status=FAIL' "$report"; then
+        "${ADB[@]}" shell am broadcast -a com.excp.podroid.action.STOP_VM >/dev/null 2>&1 || true
+        error "ACE admission produced one or more FAIL results. See $report"
+    fi
+    if grep -q 'status=UNKNOWN' "$report"; then
         warn "ACE admission contains UNKNOWN results. This is not admission certification."
+        "${ADB[@]}" shell am broadcast -a com.excp.podroid.action.STOP_VM >/dev/null 2>&1 || true
         return 2
     fi
-    success "All emitted admission criteria are PASS. Physical ACE admission evidence collected."
+    if [ "$guest_rc" -ne 0 ]; then
+        "${ADB[@]}" shell am broadcast -a com.excp.podroid.action.STOP_VM >/dev/null 2>&1 || true
+        error "Guest admission command returned non-zero exit status ${guest_rc} without a reported FAIL/UNKNOWN line. Evidence is not certifying."
+    fi
+
+    "${ADB[@]}" shell am broadcast -a com.excp.podroid.action.STOP_VM >/dev/null 2>&1 || true
+    success "All emitted admission criteria are PASS. Physical ACE admission evidence collected through Podroid native terminal transport."
 }
 
 # ── Main Logic ────────────────────────────────────────────────────────────────
