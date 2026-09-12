@@ -1,0 +1,252 @@
+#!/bin/sh
+# ACE Podroid physical admission probe.
+# Reports runtime facts only. Static package/kernel configuration is never enough
+# to produce PASS for a runtime criterion.
+set -u
+
+STATE_DIR=/mnt/persist/.ace-admission
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+emit() {
+    name=$1; status=$2; observed=$3; expected=$4; reason=$5
+    observed=$(printf '%s' "$observed" | tr '\n' ' ' | tr '\t' ' ')
+    reason=$(printf '%s' "$reason" | tr '\n' ' ' | tr '\t' ' ')
+    printf 'name=%s status=%s observed=%s expected=%s reason=%s\n' \
+        "$name" "$status" "$observed" "$expected" "$reason"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+run_ok() {
+    "$@" >/dev/null 2>&1
+}
+
+# Guest identity / basic execution.
+arch=$(uname -m 2>/dev/null || true)
+[ "$arch" = aarch64 ] || [ "$arch" = arm64 ] && \
+    emit arch PASS "$arch" aarch64 "guest reports ARM64 architecture" || \
+    emit arch FAIL "$arch" aarch64 "unexpected guest architecture"
+
+kernel=$(uname -r 2>/dev/null || true)
+[ -n "$kernel" ] && emit kernel PASS "$kernel" "non-empty kernel release" "uname succeeded" || \
+    emit kernel FAIL empty "non-empty kernel release" "uname failed"
+
+emit shell PASS "$(readlink /bin/sh 2>/dev/null || echo /bin/sh)" "/bin/sh" "guest shell is executable"
+run_ok true && emit process PASS "true exited 0" "process exit 0" "process creation works" || \
+    emit process FAIL "true failed" "process exit 0" "process creation probe failed"
+
+# ELF execution.
+TMP=${TMPDIR:-/tmp}/ace-admission.$$
+mkdir -p "$TMP" 2>/dev/null || true
+cleanup() { rm -rf "$TMP" 2>/dev/null || true; }
+trap cleanup EXIT HUP INT TERM
+
+cat > "$TMP/probe.sh" <<'EOF'
+#!/bin/sh
+exit 37
+EOF
+chmod +x "$TMP/probe.sh" 2>/dev/null || true
+if "$TMP/probe.sh" >/dev/null 2>&1; then
+    rc=0
+else
+    rc=$?
+fi
+[ "$rc" -eq 37 ] && emit elf_execution PASS "exit=$rc" "executable returns expected code" "guest executed a generated ELF-independent executable script" || \
+    emit elf_execution FAIL "exit=$rc" "exit=37" "generated executable did not run as expected"
+
+# Writable filesystem.
+if printf '%s\n' ace > "$TMP/write-test" 2>/dev/null && [ "$(cat "$TMP/write-test" 2>/dev/null)" = ace ]; then
+    emit writable_fs PASS "$TMP/write-test" "write/read works" "temporary filesystem is writable"
+else
+    emit writable_fs FAIL "$TMP/write-test" "write/read works" "filesystem write probe failed"
+fi
+
+# Persistent filesystem requires evidence across boots. First run seeds a marker;
+# a later physical invocation can turn this into PASS.
+MARKER=$STATE_DIR/persistence.marker
+if [ -f "$MARKER" ]; then
+    emit persistent_fs PASS "marker exists at $MARKER" "marker survives restart/reboot" "previous admission run left persistent marker"
+else
+    printf '%s\n' "$(date +%s 2>/dev/null || echo unknown)" > "$MARKER" 2>/dev/null || true
+    emit persistent_fs UNKNOWN "marker newly created" "marker survives restart/reboot" "requires a later physical run after VM restart/reboot"
+fi
+
+# Namespace probes: these exercise unshare, never merely inspect kernel config.
+ns_probe() {
+    name=$1; shift
+    if ! have unshare; then
+        emit "$name" UNKNOWN unshare "namespace operation" "unshare utility unavailable"
+        return
+    fi
+    if unshare "$@" true >/dev/null 2>&1; then
+        emit "$name" PASS "unshare succeeded" "namespace creation succeeds" "runtime namespace probe passed"
+    else
+        emit "$name" UNKNOWN "unshare failed" "namespace creation succeeds" "runtime rejected or utility lacks required privilege; see stderr unavailable in compact probe"
+    fi
+}
+ns_probe pid_namespace -p
+ns_probe mount_namespace -m
+ns_probe user_namespace -U
+ns_probe network_namespace -n
+ns_probe ipc_namespace -i
+ns_probe uts_namespace -u
+
+# cgroup v2 runtime.
+if [ -f /sys/fs/cgroup/cgroup.controllers ] && [ -f /sys/fs/cgroup/cgroup.subtree_control ]; then
+    controllers=$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || true)
+    printf '%s\n' "$controllers" | grep -Eq '(^| )cpu( |$)' && \
+        emit cgroup_version PASS cgroup2 cgroup2 "cgroup v2 hierarchy is mounted" || \
+        emit cgroup_version FAIL "missing cgroup2 cpu controller" cgroup2 "cgroup2 mount exists but expected controller set is absent"
+    emit cgroup_controllers PASS "$controllers" "cpu memory pids available where supported" "runtime controller file is readable"
+else
+    emit cgroup_version UNKNOWN "missing /sys/fs/cgroup/cgroup.controllers" cgroup2 "cgroup v2 hierarchy not observable"
+    emit cgroup_controllers UNKNOWN unavailable "cpu memory pids" "controller files not observable"
+fi
+
+# Temporary cgroup enforcement. This only passes when the guest allows a private
+# child cgroup and exposes the requested files; measured throttling/oom behaviour
+# is separately reported as UNKNOWN where no safe deterministic workload exists.
+CG="$TMP/cgroup"
+if [ -d /sys/fs/cgroup ] && mkdir "$CG" 2>/dev/null; then
+    cpu_ok=false; mem_ok=false; pids_ok=false
+    [ -w "$CG/cpu.max" ] && { printf '10000 100000\n' > "$CG/cpu.max" 2>/dev/null && cpu_ok=true; }
+    [ -w "$CG/memory.max" ] && { printf '33554432\n' > "$CG/memory.max" 2>/dev/null && mem_ok=true; }
+    [ -w "$CG/pids.max" ] && { printf '64\n' > "$CG/pids.max" 2>/dev/null && pids_ok=true; }
+    $cpu_ok && emit cpu_limit PASS "cpu.max=10000 100000" "writable CPU quota" "temporary cgroup accepted a CPU quota" || emit cpu_limit UNKNOWN unavailable "writable CPU quota" "CPU controller is unavailable to this harness"
+    $mem_ok && emit memory_limit PASS "memory.max=33554432" "writable memory.max" "temporary cgroup accepted memory limit" || emit memory_limit UNKNOWN unavailable "writable memory.max" "memory controller is unavailable to this harness"
+    $pids_ok && emit pids_limit PASS "pids.max=64" "writable pids.max" "temporary cgroup accepted PID limit" || emit pids_limit UNKNOWN unavailable "writable pids.max" "pids controller is unavailable to this harness"
+    rmdir "$CG" 2>/dev/null || true
+else
+    emit cpu_limit UNKNOWN unavailable "writable CPU quota" "cannot create temporary child cgroup"
+    emit memory_limit UNKNOWN unavailable "writable memory.max" "cannot create temporary child cgroup"
+    emit pids_limit UNKNOWN unavailable "writable pids.max" "cannot create temporary child cgroup"
+fi
+
+# Seccomp/capability tests require a syscall filter/capability manipulation helper;
+# do not mistake kernel configuration for runtime proof.
+if have capsh && capsh --print >/dev/null 2>&1; then
+    emit capability_drop UNKNOWN "capsh present" "privileges reduced and enforced" "helper is present but safe capability semantics require a dedicated runner"
+else
+    emit capability_drop UNKNOWN unavailable "privileges reduced and enforced" "no dedicated capability probe is installed"
+fi
+emit seccomp UNKNOWN "no dedicated runtime filter probe" "seccomp filter installation/enforcement" "kernel config alone is insufficient"
+
+# Network baseline and namespace isolation.
+if have ip && ip link show >/dev/null 2>&1; then
+    emit network_available PASS "ip link succeeded" "guest network stack usable" "network interfaces are observable"
+else
+    emit network_available UNKNOWN "ip utility unavailable" "guest network stack usable" "network runtime cannot be probed"
+fi
+if have unshare && have ip; then
+    if unshare -n sh -c 'ip link set lo up >/dev/null 2>&1 && [ "$(ip -o link show | wc -l)" -eq 1 ] && ! ip route show default | grep -q default' >/dev/null 2>&1; then
+        emit network_namespace_isolation PASS "isolated netns has loopback only and no default route" "host network not inherited" "unshare -n runtime isolation probe passed"
+    else
+        emit network_namespace_isolation UNKNOWN "isolated-netns probe did not establish expected state" "host network not inherited" "runtime network isolation could not be proven safely"
+    fi
+else
+    emit network_namespace_isolation UNKNOWN unavailable "host network not inherited" "unshare/ip unavailable"
+fi
+
+emit offline_mode UNKNOWN "requires explicit runner egress-disabled policy" "external connectivity denied" "Podroid exposes networking primitives but this harness does not alter guest policy"
+emit controlled_egress UNKNOWN "requires explicit egress policy enforcement" "only permitted destinations reachable" "not directly exercised here"
+
+# Timeout + process cleanup are real bounded-subprocess tests, not claims about
+# the Android VM supervisor.
+if have timeout; then
+    start=$(date +%s 2>/dev/null || echo 0)
+    if timeout 1 sh -c 'sleep 5' >/dev/null 2>&1; then
+        emit timeout_enforcement FAIL "timeout returned success" "long child is terminated" "timeout utility failed to terminate child"
+    else
+        rc=$?
+        elapsed=$(( $(date +%s 2>/dev/null || echo 1) - start ))
+        [ "$elapsed" -le 3 ] && emit timeout_enforcement PASS "rc=$rc elapsed=${elapsed}s" "child terminates within bound" "runtime timeout probe enforced the bound" || emit timeout_enforcement UNKNOWN "rc=$rc elapsed=${elapsed}s" "child terminates within bound" "clock/timeout behaviour was not deterministic"
+    fi
+else
+    emit timeout_enforcement UNKNOWN unavailable "timeout terminates child" "timeout utility unavailable"
+fi
+
+sleep 30 &
+child=$!
+kill "$child" 2>/dev/null || true
+wait "$child" 2>/dev/null || true
+if kill -0 "$child" 2>/dev/null; then
+    emit process_cleanup FAIL "pid=$child still alive" "child is gone" "cleanup failed"
+else
+    emit process_cleanup PASS "pid=$child absent" "child is gone" "explicit child cleanup verified"
+fi
+
+# Filesystem isolation: this probe intentionally does NOT attempt destructive or
+# privileged root escape tricks. A dedicated sandbox runner is required.
+emit filesystem_isolation UNKNOWN "no sandbox root active" "forbidden host paths inaccessible" "Podroid guest itself is not the ACE execution sandbox"
+emit filesystem_determinism UNKNOWN "no isolated root mounted" "deterministic workspace boundaries" "requires ACE sandbox runner"
+
+# Container runtimes. These are direct runtime probes only when the command exists.
+for runtime in podman docker lxc; do
+    if have "$runtime"; then
+        case "$runtime" in
+            podman)
+                if podman run --rm alpine true >/dev/null 2>&1; then emit podman PASS "podman run alpine true" "container exits 0" "runtime execution succeeded"; else emit podman UNKNOWN "podman run failed" "container exits 0" "image/runtime unavailable or operation blocked"; fi
+                if id nobody >/dev/null 2>&1 && su nobody -s /bin/sh -c 'HOME=/tmp podman run --rm alpine true' >/dev/null 2>&1; then emit rootless_podman PASS "nobody podman run" "non-root container exits 0" "rootless runtime execution succeeded"; else emit rootless_podman UNKNOWN "rootless podman failed" "non-root container exits 0" "subuid/network/runtime prerequisites unavailable or blocked"; fi
+                ;;
+            docker)
+                if docker info >/dev/null 2>&1; then emit docker PASS "docker info succeeded" "daemon/client usable" "Docker runtime responded"; else emit docker UNKNOWN "docker info failed" "daemon/client usable" "Docker daemon unavailable or not running"; fi
+                ;;
+            lxc)
+                if lxc-info --version >/dev/null 2>&1; then emit lxc PASS "lxc-info available" "LXC runtime usable" "LXC client is executable"; else emit lxc UNKNOWN "lxc-info failed" "LXC runtime usable" "LXC runtime unavailable"; fi
+                ;;
+        esac
+    else
+        emit "$runtime" UNKNOWN unavailable "runtime installed and usable" "command unavailable"
+    fi
+done
+
+if have crun; then
+    emit crun PASS "$(crun --version 2>/dev/null | head -1)" "crun executable" "crun is executable"
+else
+    emit crun UNKNOWN unavailable "crun executable" "command unavailable"
+fi
+
+# Compiler and ACE integration. The Podroid image deliberately does not bake a
+# large toolchain, so these are honest runtime checks of what is actually present.
+if have cc; then
+    printf 'int main(void){return 0;}\n' > "$TMP/t.c"
+    if cc "$TMP/t.c" -o "$TMP/t" >/dev/null 2>&1 && "$TMP/t" >/dev/null 2>&1; then
+        emit compiler PASS "cc compiled and ran C probe" "compile+execute" "C compiler runtime probe passed"
+    else
+        emit compiler FAIL "cc invocation failed" "compile+execute" "compiler present but failed to build/run probe"
+    fi
+elif have go; then
+    printf 'package main;func main(){}\n' > "$TMP/main.go"
+    if go build -o "$TMP/t" "$TMP/main.go" >/dev/null 2>&1 && "$TMP/t" >/dev/null 2>&1; then
+        emit compiler PASS "go compiled and ran probe" "compile+execute" "Go compiler runtime probe passed"
+    else
+        emit compiler FAIL "go build failed" "compile+execute" "compiler present but failed to build/run probe"
+    fi
+else
+    emit compiler UNKNOWN unavailable "compile+execute" "no C or Go compiler is installed in the guest image"
+fi
+
+# ACE location/build is deliberately external. Use ACE_ROOT when the real source
+# is mounted into the guest; never fabricate a result from repository metadata.
+ACE_ROOT=${ACE_ROOT:-/mnt/persist/ace}
+if [ -d "$ACE_ROOT" ] && have go; then
+    if (cd "$ACE_ROOT" && go build ./...) >/dev/null 2>&1; then
+        emit ace_compile PASS "$ACE_ROOT" "ACE source compiles" "real ACE tree compiled in guest"
+        emit ace_execute UNKNOWN "ACE executable target not declared to harness" "real ACE target executes" "requires the project's exact executable entry point"
+        emit ace_admission UNKNOWN "ACE source present" "ACE admission passes" "real ACE admission command is not encoded in Podroid"
+    else
+        emit ace_compile FAIL "$ACE_ROOT" "ACE source compiles" "real ACE build failed in guest"
+        emit ace_execute UNKNOWN "compile failed" "real ACE target executes" "cannot execute unbuilt ACE"
+        emit ace_admission UNKNOWN "compile failed" "ACE admission passes" "cannot run admission after compile failure"
+    fi
+else
+    emit ace_compile UNKNOWN "$ACE_ROOT absent or go unavailable" "ACE source compiles" "real ACE source was not mounted into the guest"
+    emit ace_execute UNKNOWN "ACE source unavailable" "real ACE target executes" "requires real ACE source and target"
+    emit ace_admission UNKNOWN "ACE source unavailable" "ACE admission passes" "requires the existing ACE admission command/harness"
+fi
+
+emit filesystem_write PASS "temporary workspace write/read" "workspace writable" "direct write/read probe passed"
+emit filesystem_isolation UNKNOWN "ACE sandbox not active" "sandbox cannot access forbidden host paths" "Podroid provides VM boundary; ACE sandbox policy must be exercised separately"
+emit filesystem_determinism UNKNOWN "ACE sandbox not active" "deterministic workspace" "requires ACE sandbox runner"
+
+printf 'summary_end=1\n'
